@@ -97,7 +97,7 @@ static inline char *get_command(const struct su_request *to)
 #define LOGW(fmt,args...) fprintf(stderr, fmt, ##args)
 #endif
 
-#define PLOGE(fmt,args...) ALOGE(fmt " failed with %d: %s", ##args, errno, strerror(errno))
-#define PLOGEV(fmt,err,args...) ALOGE(fmt " failed with %d: %s", ##args, err, strerror(err))
+#define PLOGE(fmt,args...) LOGE(fmt " failed with %d: %s", ##args, errno, strerror(errno))
+#define PLOGEV(fmt,err,args...) LOGE(fmt " failed with %d: %s", ##args, err, strerror(err))
 
 #endif
