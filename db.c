@@ -17,42 +17,68 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <limits.h>
-#include <cutils/log.h>
 
 #include "su.h"
 
-int database_check(const struct su_context *ctx)
+int database_check(struct su_context *ctx)
 {
     FILE *fp;
-    char allow = '-';
-    char *filename = malloc(snprintf(NULL, 0, "%s/%u-%u", REQUESTOR_STORED_PATH, ctx->from.uid, ctx->to.uid) + 1);
-    sprintf(filename, "%s/%u-%u", REQUESTOR_STORED_PATH, ctx->from.uid, ctx->to.uid);
+    char filename[PATH_MAX];
+    char allow[7];
+    int last = 0;
+    int from_uid = ctx->from.uid;
+    
+    if (ctx->user.owner_mode) {
+        from_uid = from_uid % 100000;
+    }
+
+    snprintf(filename, sizeof(filename),
+                "%s/%u-%u", ctx->user.store_path, from_uid, ctx->to.uid);
     if ((fp = fopen(filename, "r"))) {
-    LOGD("Found file");
-        char cmd[PATH_MAX];
-        fgets(cmd, sizeof(cmd), fp);
-        int last = strlen(cmd) - 1;
-        LOGD("this is the last character %u of the string", cmd[5]);
-        if (cmd[last] == '\n') {
-            cmd[last] = '\0';
-        }
-        LOGD("Comparing %c %s, %u to %s", cmd[last - 2], cmd, last, get_command(&ctx->to));
-        if (strcmp(cmd, get_command(&ctx->to)) == 0) {
-            allow = fgetc(fp);
+        LOGD("Found file %s", filename);
+        
+        while (fgets(allow, sizeof(allow), fp)) {
+            last = strlen(allow) - 1;
+            if (last >= 0)
+        	    allow[last] = 0;
+        	
+            char cmd[ARG_MAX];
+            fgets(cmd, sizeof(cmd), fp);
+            /* skip trailing '\n' */
+            last = strlen(cmd) - 1;
+            if (last >= 0)
+                cmd[last] = 0;
+
+            LOGD("Comparing '%s' to '%s'", cmd, get_command(&ctx->to));
+            if (strcmp(cmd, get_command(&ctx->to)) == 0)
+                break;
+            else if (strcmp(cmd, "any") == 0) {
+                ctx->to.all = 1;
+                break;
+            }
+            else
+                strcpy(allow, "prompt");
         }
         fclose(fp);
-    } else if ((fp = fopen(REQUESTOR_STORED_DEFAULT, "r"))) {
-    LOGD("Using default");
-        allow = fgetc(fp);
+    } else if ((fp = fopen(ctx->user.store_default, "r"))) {
+        LOGD("Using default file %s", ctx->user.store_default);
+        fgets(allow, sizeof(allow), fp);
+        last = strlen(allow) - 1;
+        if (last >=0)
+            allow[last] = 0;
+        
         fclose(fp);
     }
-    free(filename);
 
-    if (allow == '1') {
-        return DB_ALLOW;
-    } else if (allow == '0') {
-        return DB_DENY;
+    if (strcmp(allow, "allow") == 0) {
+        return ALLOW;
+    } else if (strcmp(allow, "deny") == 0) {
+        return DENY;
     } else {
-        return DB_INTERACTIVE;
+        if (ctx->user.userid != 0 && ctx->user.owner_mode) {
+            return DENY;
+        } else {
+            return INTERACTIVE;
+        }
     }
 }
