@@ -17,6 +17,10 @@
 #ifndef _UTILS_H_
 #define _UTILS_H_
 
+#ifndef PROPERTY_VALUE_MAX
+#define PROPERTY_VALUE_MAX  92
+#endif
+
 /* reads a file, making sure it is terminated with \n \0 */
 extern char* read_file(const char *fn);
 

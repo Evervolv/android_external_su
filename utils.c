@@ -24,7 +24,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <cutils/properties.h>
+
+#include "utils.h"
 
 /* reads a file, making sure it is terminated with \n \0 */
 char* read_file(const char *fn)
