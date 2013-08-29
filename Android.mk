@@ -6,6 +6,7 @@ LOCAL_MODULE := su
 LOCAL_SRC_FILES := \
 	su.c \
 	daemon.c \
+	pts.c \
 	activity.c \
 	db.c \
 	utils.c \
