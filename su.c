@@ -559,6 +559,9 @@ static __attribute__ ((noreturn)) void allow(struct su_context *ctx) {
  * Find the properties ourselves.
  */
 int access_disabled(const struct su_initiator *from) {
+#ifndef SUPERUSER_EMBEDDED
+    return 0;
+#else
     char *data;
     char build_type[PROPERTY_VALUE_MAX];
     char debuggable[PROPERTY_VALUE_MAX], enabled[PROPERTY_VALUE_MAX];
@@ -608,18 +611,26 @@ int access_disabled(const struct su_initiator *from) {
 
     }
     return 0;
+#endif
+}
+
+static int get_api_version() {
+  char sdk_ver[PROPERTY_VALUE_MAX];
+  char *data = read_file("/system/build.prop");
+  get_property(data, sdk_ver, "ro.build.version.sdk", "0");
+  int ver = atoi(sdk_ver);
+  free(data);
+  return ver;
 }
 
 int main(int argc, char *argv[]) {
+    return su_main(argc, argv, 1);
+}
+
+int su_main(int argc, char *argv[], int need_client) {
     // start up in daemon mode if prompted
     if (argc == 2 && strcmp(argv[1], "--daemon") == 0) {
         return run_daemon();
-    }
-
-    if (geteuid() != AID_ROOT && getuid() != AID_ROOT) {
-        // attempt to connect to daemon...
-        LOGD("starting daemon client %d %d", getuid(), geteuid());
-        return connect_daemon(argc, argv);
     }
 
     // Sanitize all secure environment variables (from linker_environ.c in AOSP linker).
@@ -755,6 +766,20 @@ int main(int argc, char *argv[]) {
             usage(2);
         }
     }
+
+    if (need_client) {
+        // attempt to use the daemon client if not root,
+        // or this is api 18 and adb shell (/data is not readable even as root)
+        // or just always use it on API 19+ (ART)
+        if ((geteuid() != AID_ROOT && getuid() != AID_ROOT) ||
+            (get_api_version() >= 18 && getuid() == AID_SHELL) ||
+            get_api_version() >= 19) {
+            // attempt to connect to daemon...
+            LOGD("starting daemon client %d %d", getuid(), geteuid());
+            return connect_daemon(argc, argv);
+        }
+    }
+
     if (optind < argc && !strcmp(argv[optind], "-")) {
         ctx.to.login = 1;
         optind++;

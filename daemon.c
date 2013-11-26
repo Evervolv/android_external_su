@@ -15,6 +15,8 @@
 ** limitations under the License.
 */
 
+#define _GNU_SOURCE /* for unshare() */
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -29,11 +31,17 @@
 #include <getopt.h>
 #include <stdint.h>
 #include <pwd.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <sys/types.h>
 #include <pthread.h>
+#include <sched.h>
 #include <termios.h>
+
+#ifdef SUPERUSER_EMBEDDED
+#include <cutils/multiuser.h>
+#endif
 
 #include "su.h"
 #include "utils.h"
@@ -45,7 +53,7 @@ int daemon_from_pid = 0;
 static int read_int(int fd) {
     int val;
     int len = read(fd, &val, sizeof(int));
-    if (len < sizeof(int)) {
+    if (len != sizeof(int)) {
         LOGE("unable to read int");
         exit(-1);
     }
@@ -62,11 +70,15 @@ static void write_int(int fd, int val) {
 
 static char* read_string(int fd) {
     int len = read_int(fd);
-    if (len > PATH_MAX) {
-        LOGE("string too long");
+    if (len > PATH_MAX || len < 0) {
+        LOGE("invalid string length %d", len);
         exit(-1);
     }
     char* val = malloc(sizeof(char) * (len + 1));
+    if (val == NULL) {
+        LOGE("unable to malloc string");
+        exit(-1);
+    }
     val[len] = '\0';
     int amount = read(fd, val, len);
     if (amount != len) {
@@ -85,6 +97,43 @@ static void write_string(int fd, char* val) {
         exit(-1);
     }
 }
+
+#ifdef SUPERUSER_EMBEDDED
+static void mount_emulated_storage(int user_id) {
+    const char *emulated_source = getenv("EMULATED_STORAGE_SOURCE");
+    const char *emulated_target = getenv("EMULATED_STORAGE_TARGET");
+    const char* legacy = getenv("EXTERNAL_STORAGE");
+
+    if (!emulated_source || !emulated_target) {
+        // No emulated storage is present
+        return;
+    }
+
+    // Create a second private mount namespace for our process
+    if (unshare(CLONE_NEWNS) < 0) {
+        PLOGE("unshare");
+        return;
+    }
+
+    if (mount("rootfs", "/", NULL, MS_SLAVE | MS_REC, NULL) < 0) {
+        PLOGE("mount rootfs as slave");
+        return;
+    }
+
+    // /mnt/shell/emulated -> /storage/emulated
+    if (mount(emulated_source, emulated_target, NULL, MS_BIND, NULL) < 0) {
+        PLOGE("mount emulated storage");
+    }
+
+    char target_user[PATH_MAX];
+    snprintf(target_user, PATH_MAX, "%s/%d", emulated_target, user_id);
+
+    // /mnt/shell/emulated/<user> -> /storage/emulated/legacy
+    if (mount(target_user, legacy, NULL, MS_BIND | MS_REC, NULL) < 0) {
+        PLOGE("mount legacy path");
+    }
+}
+#endif
 
 static int run_daemon_child(int infd, int outfd, int errfd, int argc, char** argv) {
     if (-1 == dup2(outfd, STDOUT_FILENO)) {
@@ -106,7 +155,7 @@ static int run_daemon_child(int infd, int outfd, int errfd, int argc, char** arg
     close(outfd);
     close(errfd);
 
-    return main(argc, argv);
+    return su_main(argc, argv, 0);
 }
 
 static void pump(int input, int output) {
@@ -131,6 +180,10 @@ static void* pump_thread(void* data) {
 static void pump_async(int input, int output) {
     pthread_t writer;
     int* files = (int*)malloc(sizeof(int) * 2);
+    if (files == NULL) {
+        LOGE("unable to pump_async");
+        exit(-1);
+    }
     files[0] = input;
     files[1] = output;
     pthread_create(&writer, NULL, pump_thread, files);
@@ -146,7 +199,28 @@ static int daemon_accept(int fd) {
     LOGD("remote uid: %d", daemon_from_uid);
     daemon_from_pid = read_int(fd);
     LOGD("remote req pid: %d", daemon_from_pid);
+
+    struct ucred credentials;
+    int ucred_length = sizeof(struct ucred);
+    /* fill in the user data structure */
+    if(getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &ucred_length)) {
+        LOGE("could obtain credentials from unix domain socket");
+        exit(-1);
+    }
+    // if the credentials on the other side of the wire are NOT root,
+    // we can't trust anything being sent.
+    if (credentials.uid != 0) {
+        daemon_from_uid = credentials.uid;
+        pid = credentials.pid;
+        daemon_from_pid = credentials.pid;
+    }
+
+    int mount_storage = read_int(fd);
     int argc = read_int(fd);
+    if (argc < 0 || argc > 512) {
+        LOGE("unable to allocate args: %d", argc);
+        exit(-1);
+    }
     LOGD("remote args: %d", argc);
     char** argv = (char**)malloc(sizeof(char*) * (argc + 1));
     argv[argc] = NULL;
@@ -178,6 +252,9 @@ static int daemon_accept(int fd) {
     chown(outfile, daemon_from_uid, 0);
     chown(infile, daemon_from_uid, 0);
     chown(errfile, daemon_from_uid, 0);
+    chmod(outfile, 0660);
+    chmod(infile, 0660);
+    chmod(errfile, 0660);
 
     // ack
     write_int(fd, 1);
@@ -200,17 +277,17 @@ static int daemon_accept(int fd) {
 
     int outfd = open(outfile, O_WRONLY);
     if (outfd <= 0) {
-        PLOGE("outfd");
+        PLOGE("outfd daemon %s", outfile);
         goto done;
     }
     int errfd = open(errfile, O_WRONLY);
     if (errfd <= 0) {
-        PLOGE("errfd");
+        PLOGE("errfd daemon %s", errfile);
         goto done;
     }
     int infd = open(infile, O_RDONLY);
     if (infd <= 0) {
-        PLOGE("infd");
+        PLOGE("infd daemon %s", infile);
         goto done;
     }
 
@@ -259,6 +336,12 @@ static int daemon_accept(int fd) {
             outfd = pts;
         }
 
+#ifdef SUPERUSER_EMBEDDED
+        if (mount_storage) {
+            mount_emulated_storage(multiuser_get_user_id(daemon_from_uid));
+        }
+#endif
+
         return run_daemon_child(infd, outfd, errfd, argc, argv);
     }
 
@@ -292,6 +375,11 @@ done:
 }
 
 int run_daemon() {
+    if (getuid() != 0 || getgid() != 0) {
+        PLOGE("daemon requires root. uid/gid not root");
+        return -1;
+    }
+
     int fd;
     struct sockaddr_un sun;
 
@@ -386,14 +474,21 @@ int connect_daemon(int argc, char *argv[]) {
     }
 
     LOGD("connecting client %d", getpid());
+
+    int mount_storage = getenv("MOUNT_EMULATED_STORAGE") != NULL;
+
     write_int(socketfd, getpid());
     write_int(socketfd, isatty(STDIN_FILENO));
     write_int(socketfd, uid);
     write_int(socketfd, getppid());
-    write_int(socketfd, argc);
+    write_int(socketfd, mount_storage);
+    write_int(socketfd, mount_storage ? argc - 1 : argc);
 
     int i;
     for (i = 0; i < argc; i++) {
+        if (i == 1 && mount_storage) {
+            continue;
+        }
         write_string(socketfd, argv[i]);
     }
 
@@ -402,17 +497,17 @@ int connect_daemon(int argc, char *argv[]) {
 
     int outfd = open(outfile, O_RDONLY);
     if (outfd <= 0) {
-        PLOGE("outfd");
+        PLOGE("outfd %s ", outfile);
         exit(-1);
     }
     int errfd = open(errfile, O_RDONLY);
     if (errfd <= 0) {
-        PLOGE("errfd");
+        PLOGE("errfd %s", errfile);
         exit(-1);
     }
     int infd = open(infile, O_WRONLY);
     if (infd <= 0) {
-        PLOGE("infd");
+        PLOGE("infd %s", infile);
         exit(-1);
     }
 
